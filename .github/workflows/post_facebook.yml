@@ -1,0 +1,31 @@
+name: Post hourly story to Facebook
+
+on:
+  schedule:
+    - cron: '0 * * * *'   # كل ساعة عند الدقيقة 0 (توقيت UTC)
+  workflow_dispatch:
+
+jobs:
+  post_story:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run poster script
+        env:
+          HF_API_TOKEN: ${{ secrets.HF_API_TOKEN }}
+          FB_PAGE_ACCESS_TOKEN: ${{ secrets.FB_PAGE_ACCESS_TOKEN }}
+          FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
+        run: |
+          python post_to_facebook_qwen.py
