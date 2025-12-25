@@ -1,117 +1,97 @@
 #!/usr/bin/env python3
-# post_to_facebook_qwen.py  (مُحدّث لاستخدام Router API)
-import os
-import time
-import requests
-import sys
-import json
+# post_to_facebook_qwen.py (مرن: يقرأ HF_MODEL من env، يطبع استجابة Router عند الخطأ)
 
-# ---------- الإعدادات عبر GitHub Secrets ----------
+import os, time, requests, sys, json
+
 HF_TOKEN = os.getenv("HF_API_TOKEN")
 FB_PAGE_TOKEN = os.getenv("FB_PAGE_ACCESS_TOKEN")
 FB_PAGE_ID = os.getenv("FB_PAGE_ID")
+HF_MODEL = os.getenv("HF_MODEL", "deepseek-ai/DeepSeek-V3.2")  # الافتراضي الآن deepseek
 
 if not (HF_TOKEN and FB_PAGE_TOKEN and FB_PAGE_ID):
-    print("ERROR: Missing environment variables. Set HF_API_TOKEN, FB_PAGE_ACCESS_TOKEN, FB_PAGE_ID as repository secrets.")
+    print("ERROR: Missing HF_API_TOKEN, FB_PAGE_ACCESS_TOKEN or FB_PAGE_ID.")
     sys.exit(1)
 
-# --------- استخدام Router endpoint الجديد -------------
 ROUTER_CHAT_URL = "https://router.huggingface.co/v1/chat/completions"
-MODEL = "Qwen/Qwen3-1.7B"  # أو "Qwen/Qwen3-1.7B:latest" إذا أردت تحديد الوسم
-HEADERS = {
-    "Authorization": f"Bearer {HF_TOKEN}",
-    "Content-Type": "application/json"
-}
+HEADERS = {"Authorization": f"Bearer {HF_TOKEN}", "Content-Type": "application/json"}
 
 PROMPT_AR = (
-    "أنت كاتب عربي محترف. اكتب مخرجاً متسقاً ومهيّأ بصيغة نصية قابلة للتحليل:\n"
+    "أنت كاتب عربي محترف. اكتب مخرجاً متسقاً بصيغة قابلة للتحليل:\n"
     "- عنوان القصة (سطر واحد)\n"
     "- فاصل: ###STORY###\n"
-    "- القصة نفسها (120-220 كلمة تقريباً، بالعربية الفصحى، لغة واضحة، قصة أخلاقية فيها عبرة)\n"
+    "- القصة (120-220 كلمة بالعربية الفصحى)\n"
     "- فاصل: ###LESSON###\n"
-    "- العبرة (سطر أو سطرين).\n\n"
-    "شروط صارمة: لا محتوى جنسي/فاحش، لا دعوة لدين آخر، لا سب أو إهانات، أسلوب ملهم ومناسب للفيسبوك.\n"
-    "أعِد الإخراج بنفس الفواصل المذكورة بالضبط."
+    "- العبرة (سطر أو سطرين).\n"
+    "شروط: لا محتوى جنسي أو إساءة أو دعوة لدين غير الإسلام. أنت مُلزم بالالتزام."
 )
 
-FORBIDDEN_KEYWORDS = [
-    "جنس", "أغراء", "مضاجعة", "ممارسة", "عاهرة", "عاهر", "شرم", "فرج", "عارية", "مفاتن",
-    "لعنة", "غبي", "أحمق", "خرا", "قحبة",
-    "مسيح", "نصراني", "مسيحية", "يهودي", "يهودية", "بوذي", "هندوسي", "شرك",
-    "كفر", "الالحاد", "شتيمة لله", "سب الله"
+FORBIDDEN = [
+    "جنس","أغراء","مضاجعة","ممارسة","عاهرة","عاهر","شرم","فرج","عارية","مفاتن",
+    "لعنة","غبي","أحمق","خرا","قحبة",
+    "مسيح","نصراني","مسيحية","يهودي","يهودية","بوذي","هندوسي","شرك",
+    "كفر","الالحاد","شتيمة لله","سب الله"
 ]
-LOWER_FORBIDDEN = [w.lower() for w in FORBIDDEN_KEYWORDS]
+LOWER_FORB = [w.lower() for w in FORBIDDEN]
 
-def generate_with_qwen_chat(prompt, max_retries=3):
+def generate_with_router(prompt, model, retries=3):
     payload = {
-        "model": MODEL,
-        "messages": [
-            {"role": "user", "content": prompt}
-        ],
-        # معلمات شبيهة بالـ OpenAI
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.8,
         "max_tokens": 360,
         "top_p": 0.95,
         "n": 1
     }
-    for attempt in range(1, max_retries + 1):
+    for attempt in range(1, retries+1):
+        r = requests.post(ROUTER_CHAT_URL, headers=HEADERS, json=payload, timeout=120)
+        if r.status_code == 429:
+            wait = 10 * attempt
+            print(f"Rate limited, sleeping {wait}s (attempt {attempt})")
+            time.sleep(wait)
+            continue
+        if r.status_code == 404:
+            print("404 from Router. Response JSON (diagnostic):")
+            try:
+                print(json.dumps(r.json(), ensure_ascii=False, indent=2))
+            except Exception:
+                print(r.text)
+            r.raise_for_status()
         try:
-            r = requests.post(ROUTER_CHAT_URL, headers=HEADERS, json=payload, timeout=120)
-            if r.status_code == 429:
-                wait = 10 * attempt
-                print(f"Rate limited (429). Waiting {wait}s (attempt {attempt})")
-                time.sleep(wait)
-                continue
             r.raise_for_status()
             data = r.json()
-            # نبحث بعناية عن نص الرد ضمن أشكال متعددة ممكنة
-            # شكل شائع: {"choices":[{"message":{"role":"assistant","content":"..."}}, ...]}
+            # استخراج النص من الصيغ الشائعة
             text = None
             if isinstance(data, dict):
                 choices = data.get("choices")
-                if isinstance(choices, list) and len(choices) > 0:
+                if isinstance(choices, list) and choices:
                     first = choices[0]
-                    # حالات متعددة
                     if isinstance(first.get("message"), dict) and "content" in first["message"]:
                         text = first["message"]["content"]
                     elif "text" in first:
                         text = first["text"]
-                    elif "message" in first and isinstance(first["message"], str):
-                        text = first["message"]
-                # بعض صيغ Router قد ترجع 'output' أو 'output_text'
                 if not text:
-                    if "output_text" in data:
-                        text = data["output_text"]
-                    elif "output" in data and isinstance(data["output"], str):
-                        text = data["output"]
-            # fallback: stringify
+                    text = data.get("output_text") or data.get("output")
             if not text:
                 text = json.dumps(data, ensure_ascii=False)
             return text.strip()
         except requests.HTTPError as e:
-            print("HTTPError:", e, getattr(e.response, "text", ""))
-            if attempt < max_retries:
+            print("HTTP error on attempt", attempt, "-", e)
+            if attempt < retries:
                 time.sleep(5 * attempt)
                 continue
             raise
-        except Exception as e:
-            print("Error:", e)
-            if attempt < max_retries:
-                time.sleep(3 * attempt)
-                continue
-            raise
-    raise RuntimeError("Failed to get generation after retries")
+    raise RuntimeError("Failed to get model output")
 
 def parse_generated(text):
     if "###STORY###" in text and "###LESSON###" in text:
         try:
-            title_part, rest = text.split("###STORY###", 1)
-            story_part, lesson_part = rest.split("###LESSON###", 1)
+            title_part, rest = text.split("###STORY###",1)
+            story_part, lesson_part = rest.split("###LESSON###",1)
             title = title_part.strip().splitlines()[0].strip()
             story = story_part.strip()
             lesson = lesson_part.strip().splitlines()[0].strip()
             return title, story, lesson
-        except Exception:
+        except:
             pass
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     if len(lines) >= 3:
@@ -123,7 +103,7 @@ def parse_generated(text):
 
 def contains_forbidden(text):
     lowered = text.lower()
-    for fw in LOWER_FORBIDDEN:
+    for fw in LOWER_FORB:
         if fw in lowered:
             return True, fw
     return False, None
@@ -133,38 +113,37 @@ def tidy_text(s, limit=3000):
         return s
     cut = s[:limit]
     if " " in cut:
-        cut = cut.rsplit(" ", 1)[0]
+        cut = cut.rsplit(" ",1)[0]
     return cut + "…"
 
 def post_to_facebook(message):
-    graph_url = f"https://graph.facebook.com/v17.0/{FB_PAGE_ID}/feed"
-    payload = {"message": message, "access_token": FB_PAGE_TOKEN}
-    r = requests.post(graph_url, data=payload, timeout=20)
+    url = f"https://graph.facebook.com/v17.0/{FB_PAGE_ID}/feed"
+    r = requests.post(url, data={"message":message,"access_token":FB_PAGE_TOKEN}, timeout=20)
     r.raise_for_status()
     return r.json()
 
 def main():
-    for attempt in range(1, 6):
-        print(f"[Attempt {attempt}] Requesting generation from HF Router...")
-        raw = generate_with_qwen_chat(PROMPT_AR)
-        print("Raw generation preview:", raw[:400].replace("\n", " ") + ("..." if len(raw) > 400 else ""))
+    print("Using HF model:", HF_MODEL)
+    for attempt in range(1,6):
+        print(f"[Attempt {attempt}] Requesting generation...")
+        raw = generate_with_router(PROMPT_AR, HF_MODEL)
+        print("Raw preview:", raw[:400].replace("\n"," ") + ("..." if len(raw)>400 else ""))
         title, story, lesson = parse_generated(raw)
-        if not title or not story or not lesson:
-            print("Parsing failed or incomplete structure, retrying...")
+        if not (title and story and lesson):
+            print("Could not parse generation into title/story/lesson. Retrying...")
             time.sleep(2)
             continue
-        combined = " ".join([title, story, lesson])
-        bad, word = contains_forbidden(combined)
+        bad, w = contains_forbidden(" ".join([title,story,lesson]))
         if bad:
-            print(f"Found forbidden keyword '{word}' in generation — retrying...")
+            print("Found forbidden word:", w, " — retrying.")
             time.sleep(2)
             continue
-        final_text = f"{title}\n\n{story}\n\nالعبرة: {lesson}\n\n#قصص\n\nإذا أعجبتك القصة لا تنسى متابعة الصفحة."
-        final_text = tidy_text(final_text, limit=3000)
+        final = f"{title}\n\n{story}\n\nالعبرة: {lesson}\n\n#قصص\n\nإذا أعجبتك القصة لا تنسى متابعة الصفحة."
+        final = tidy_text(final)
         try:
-            print("Posting to Facebook (preview first 300 chars):", final_text[:300])
-            res = post_to_facebook(final_text)
-            print("Posted successfully. Response:", res)
+            print("Posting preview (first 300 chars):", final[:300])
+            res = post_to_facebook(final)
+            print("Posted. Response:", res)
             return
         except requests.HTTPError as e:
             print("Facebook HTTP error:", e, getattr(e.response, "text", ""))
@@ -180,8 +159,8 @@ def main():
                 continue
             else:
                 raise
-    print("Failed to generate a suitable story after multiple attempts.")
+    print("Failed after multiple attempts.")
     sys.exit(1)
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
